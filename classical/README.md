@@ -16,38 +16,24 @@ This implementation achieves **81.89% balanced accuracy** using an ensemble of 1
 ## Quick Start
 
 ```bash
-# 1. Preprocess the dataset
-python preprocess.py
-
-# 2. Train the 12-model ensemble (~30-60 minutes)
+# 1. Train the 12-model ensemble (~30-60 minutes)
+#    Preprocessing happens automatically inside this script
 python train_ensemble.py
 
-# 3. Optimize thresholds and ensemble strategy
+# 2. Optimize thresholds and ensemble strategy
 python optimize_ensemble.py
 ```
 
 ## File Descriptions
 
-### `preprocess.py`
-Comprehensive feature engineering and data preparation.
+### `train_ensemble.py`
+Trains 12 diverse gradient boosting models with early stopping. **Includes preprocessing**.
 
-**What it does:**
+**Preprocessing (done automatically):**
 - Loads raw wildfire dataset from `../data/Wildfire_Dataset.csv`
 - Engineers 60+ derived features (temporal, interaction, seasonal)
 - Splits into train (70%), validation (15%), test (15%) with stratification
 - Scales features using StandardScaler
-- Saves preprocessed data to `preprocessed/` directory
-
-**Output:**
-- `preprocessed/train_data.pkl` - Training features and labels
-- `preprocessed/val_data.pkl` - Validation features and labels  
-- `preprocessed/test_data.pkl` - Test features and labels
-- `preprocessed/scaler.pkl` - Fitted StandardScaler for inference
-
-**Run time:** ~10-20 minutes
-
-### `train_ensemble.py`
-Trains 12 diverse gradient boosting models with early stopping.
 
 **Architecture:**
 - **6 XGBoost models** with varied configurations:
@@ -61,7 +47,8 @@ Trains 12 diverse gradient boosting models with early stopping.
   - Min child samples: 20 - 50
 
 **What it does:**
-- Loads preprocessed data
+- Loads and preprocesses raw dataset
+- Engineers features inline
 - Trains each model with validation-based early stopping
 - Saves individual models to `models/` directory
 - Saves predictions and metadata to `results/` directory
@@ -228,11 +215,11 @@ Core libraries (see `../requirements.txt` for versions):
 ### "File not found: Wildfire_Dataset.csv"
 - Download dataset from Kaggle (see `../data/README.md`)
 - Place in `../data/` directory
-- Run `preprocess.py` before training
+- Run `train_ensemble.py` (preprocessing happens automatically)
 
 ### "Out of memory" during training
 - Close other applications
-- Reduce dataset size in `preprocess.py` (sample fewer rows)
+- Reduce dataset size in `train_ensemble.py` (modify the data loading section to sample fewer rows)
 - Train models sequentially instead of in parallel (modify `train_ensemble.py`)
 
 ### "Module not found" errors
@@ -281,7 +268,8 @@ with open('config/optimal_config.pkl', 'wb') as f:
 ```python
 import pickle
 import pandas as pd
-from preprocess import engineer_features
+# Import engineer_features function from train_ensemble.py
+from train_ensemble import engineer_features
 
 # Load trained models and preprocessing config
 models = []

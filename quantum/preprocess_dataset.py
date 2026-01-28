@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Wildfire Dataset Preprocessing Pipeline - Quantum ML
+Wildfire Dataset Preprocessing Pipeline
 
 This script performs comprehensive feature engineering and data preparation for
 quantum machine learning model training. The pipeline processes raw wildfire
@@ -14,19 +14,11 @@ Key Operations:
     - Standardization using sklearn's StandardScaler
     - Stratified splitting to preserve class balance across splits
     - Model-wise sharding for distributed training
-    - Exact 64-feature output for 6-qubit amplitude embedding
 
 Output:
     - preprocessed/model_X.pkl: Training/validation/test data for each model
     - preprocessed/metadata.pkl: Feature names, scaler parameters, split ratios
     - logs/preprocess.log: Detailed processing log with timing and memory usage
-
-Usage:
-    python preprocess.py [--data PATH] [--output DIR] [--models N]
-    
-    --data PATH    : Path to Wildfire_Dataset.csv (default: ../data/Wildfire_Dataset.csv)
-    --output DIR   : Output directory for preprocessed files (default: ./preprocessed)
-    --models N     : Number of model shards to create (default: 12)
 
 Dependencies:
     - pandas: DataFrame operations and temporal grouping
@@ -40,7 +32,6 @@ import sys
 import time
 import pickle
 import traceback
-import argparse
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -50,6 +41,8 @@ from sklearn.model_selection import train_test_split
 # ============================================================================
 # MEMORY PROFILING UTILITY
 # ============================================================================
+# Provides real-time memory usage tracking during preprocessing operations.
+# Falls back gracefully if psutil is unavailable.
 
 try:
     import psutil
@@ -62,42 +55,45 @@ except Exception:
         return -1.0
 
 # ============================================================================
-# CONFIGURATION CLASS
+# CONFIGURATION PARAMETERS
 # ============================================================================
 
-class PreprocessConfig:
-    """Configuration for quantum preprocessing pipeline."""
+N_MODELS = 12                    # Number of parallel quantum models to train
+N_QUBITS = 6                     # Qubits available for amplitude embedding
+TARGET_FEATURES = 2 ** N_QUBITS  # Required feature count (64) for 6-qubit embedding
+RAW_CSV = '../data/Wildfire_Dataset.csv' # Input dataset path
+PREPROC_DIR = 'preprocessed'     # Output directory for processed shards
+LOG_DIR = 'logs'                 # Directory for processing logs
+LOG_FILE = os.path.join(LOG_DIR, 'preprocess.log')
+
+# Split ratios for train/validation/test partitioning
+TRAIN_RATIO = 0.70  # 70% of data for training
+VAL_RATIO = 0.15    # 15% for validation (hyperparameter tuning)
+TEST_RATIO = 0.15   # 15% for final evaluation (never seen during training)
+
+# Ensure output directories exist
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(PREPROC_DIR, exist_ok=True)
+
+def log(msg):
+    """
+    Dual-output logging function.
     
-    def __init__(self, data_path='../data/Wildfire_Dataset.csv', 
-                 output_dir='./preprocessed', n_models=12):
-        self.n_models = n_models
-        self.n_qubits = 6
-        self.target_features = 2 ** self.n_qubits  # 64 features for amplitude embedding
-        self.data_path = data_path
-        self.output_dir = output_dir
-        self.log_dir = './logs'
-        self.log_file = os.path.join(self.log_dir, 'preprocess.log')
-        
-        # Split ratios
-        self.train_ratio = 0.70
-        self.val_ratio = 0.15
-        self.test_ratio = 0.15
-        
-        # Create directories
-        os.makedirs(self.log_dir, exist_ok=True)
-        os.makedirs(self.output_dir, exist_ok=True)
+    Writes message to both console (stdout) and persistent log file with
+    ISO 8601 timestamp for audit trail and debugging.
     
-    def log(self, msg):
-        """Dual-output logging to console and file."""
-        print(msg)
-        with open(self.log_file, 'a', encoding='utf-8') as f:
-            f.write(f"{datetime.now().isoformat()} | {msg}\n")
+    Args:
+        msg (str): Message to log
+    """
+    print(msg)
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"{datetime.now().isoformat()} | {msg}\n")
 
 # ============================================================================
 # FEATURE ENGINEERING PIPELINE
 # ============================================================================
 
-def engineer_features(df, config):
+def engineer_features(df):
     """
     Comprehensive feature engineering for wildfire prediction.
     
@@ -114,28 +110,41 @@ def engineer_features(df, config):
         5. Lag Features: Previous day values for temporal context
         6. Rate of Change: Day-to-day deltas indicating rapid changes
     
+    Processing Flow:
+        - Sort by location and time to enable temporal operations
+        - Compute basic derived features from raw measurements
+        - Calculate interaction terms between related variables
+        - Apply rolling windows grouped by geographic location
+        - Compute lag features using shift operations
+        - Fill missing values from lag/diff operations using backfill
+    
     Args:
         df (pd.DataFrame): Raw wildfire dataset with meteorological columns
-        config (PreprocessConfig): Configuration object
         
     Returns:
         pd.DataFrame: Enhanced dataset with engineered features
+        
+    Note:
+        All temporal operations (rolling, lag, diff) are grouped by location
+        (latitude, longitude) to prevent information leakage across spatial
+        boundaries. Missing values from first observations are backfilled
+        within groups then filled with zero.
     """
     start_time = time.time()
-    config.log("[STEP] Starting comprehensive feature engineering...")
 
     df_eng = df.copy()
 
     # ------------------------------------------------------------------------
     # TEMPORAL ORDERING AND PARSING
     # ------------------------------------------------------------------------
+    # Sort dataset by location then timestamp to enable proper temporal
+    # feature calculation. All rolling/lag operations require chronological
+    # ordering within each geographic location.
     
     if 'datetime' in df_eng.columns:
         df_eng['datetime_parsed'] = pd.to_datetime(df_eng['datetime'])
         df_eng = df_eng.sort_values(['latitude', 'longitude', 'datetime_parsed']).reset_index(drop=True)
-        config.log("  Sorted by location and timestamp")
     else:
-        config.log("[WARN] No 'datetime' column found, skipping temporal features")
         return df_eng
 
     # ------------------------------------------------------------------------
@@ -143,96 +152,125 @@ def engineer_features(df, config):
     # ------------------------------------------------------------------------
     
     # Temperature features
+    # Range captures diurnal temperature variation (higher = more extreme)
+    # Average provides baseline thermal conditions
+    # Variance amplifies the range signal for model emphasis
     if 'tmmx' in df_eng.columns and 'tmmn' in df_eng.columns:
         df_eng['temp_range'] = df_eng['tmmx'] - df_eng['tmmn']
         df_eng['temp_avg'] = (df_eng['tmmx'] + df_eng['tmmn']) / 2
         df_eng['temp_variance'] = (df_eng['tmmx'] - df_eng['tmmn']) ** 2
-        config.log("  Added: temp_range, temp_avg, temp_variance")
     
     # Humidity features
+    # Range shows daily humidity fluctuation
+    # Average provides baseline moisture level
+    # Dryness index inverts minimum humidity (higher = drier, more fire risk)
     if 'rmax' in df_eng.columns and 'rmin' in df_eng.columns:
         df_eng['humidity_range'] = df_eng['rmax'] - df_eng['rmin']
         df_eng['humidity_avg'] = (df_eng['rmax'] + df_eng['rmin']) / 2
         df_eng['dryness_index'] = 100 - df_eng['rmin']
-        config.log("  Added: humidity_range, humidity_avg, dryness_index")
     
     # ------------------------------------------------------------------------
     # PHYSICAL INTERACTION FEATURES
     # ------------------------------------------------------------------------
+    # These capture multiplicative effects between related variables that
+    # domain knowledge suggests are important for fire behavior.
     
-    # VPD × Temperature interaction
+    # Vapor Pressure Deficit (VPD) interactions
+    # VPD measures atmospheric moisture demand - key fire weather indicator
+    # vpd_temp: Combined heat and dryness stress on vegetation
+    # vpd_squared: Amplifies high VPD values (exponential fire risk increase)
     if 'vpd' in df_eng.columns and 'tmmx' in df_eng.columns:
         df_eng['vpd_temp'] = df_eng['vpd'] * df_eng['tmmx']
         df_eng['vpd_squared'] = df_eng['vpd'] ** 2
-        config.log("  Added: vpd_temp, vpd_squared")
     
-    # Wind × ERC interaction
+    # Wind and Energy Release Component (ERC) interaction
+    # ERC measures potential energy release from burning fuels
+    # High wind + high ERC = rapid fire spread potential
+    # wind_squared: Emphasizes strong wind events (wind effects non-linear)
     if 'vs' in df_eng.columns and 'erc' in df_eng.columns:
         df_eng['wind_erc'] = df_eng['vs'] * df_eng['erc']
         df_eng['wind_squared'] = df_eng['vs'] ** 2
-        config.log("  Added: wind_erc, wind_squared")
     
     # Fuel moisture features
+    # fm100/fm1000 are 100-hour and 1000-hour fuel moisture levels
+    # Ratio captures relative drying of different fuel size classes
+    # Difference shows moisture gradient across fuel types
+    # Average provides overall fuel moisture status
     if 'fm100' in df_eng.columns and 'fm1000' in df_eng.columns:
         df_eng['fuel_moisture_ratio'] = df_eng['fm100'] / (df_eng['fm1000'] + 1e-6)
         df_eng['fuel_moisture_diff'] = df_eng['fm1000'] - df_eng['fm100']
         df_eng['fuel_moisture_avg'] = (df_eng['fm100'] + df_eng['fm1000']) / 2
-        config.log("  Added: fuel_moisture features")
     
-    # Drought stress
+    # Drought stress indicator
+    # High VPD with low precipitation creates severe drought conditions
+    # Ratio amplifies when precipitation is minimal
     if 'pr' in df_eng.columns and 'vpd' in df_eng.columns:
         df_eng['drought_stress'] = df_eng['vpd'] / (df_eng['pr'] + 1e-6)
-        config.log("  Added: drought_stress")
     
-    # Heat load
+    # Heat load from solar radiation
+    # Solar radiation (srad) combined with high temperature increases
+    # surface heating and fuel drying rate
     if 'srad' in df_eng.columns and 'tmmx' in df_eng.columns:
         df_eng['heat_load'] = df_eng['srad'] * df_eng['tmmx']
-        config.log("  Added: heat_load")
     
     # ERC squared
+    # Amplifies high energy release conditions (fire behavior non-linear
+    # with increasing ERC values)
     if 'erc' in df_eng.columns:
         df_eng['erc_squared'] = df_eng['erc'] ** 2
-        config.log("  Added: erc_squared")
     
     # Fire spread potential
+    # Burning Index (bi) indicates fire intensity potential
+    # Combined with wind speed gives overall fire spread risk
     if 'bi' in df_eng.columns and 'vs' in df_eng.columns:
         df_eng['fire_spread_potential'] = df_eng['bi'] * df_eng['vs']
-        config.log("  Added: fire_spread_potential")
     
     # Geographic features
+    # Squared terms capture non-linear geographic effects
+    # Interaction term captures diagonal gradients across the region
     if 'latitude' in df_eng.columns and 'longitude' in df_eng.columns:
         df_eng['lat_squared'] = df_eng['latitude'] ** 2
         df_eng['lon_squared'] = df_eng['longitude'] ** 2
         df_eng['lat_lon_interaction'] = df_eng['latitude'] * df_eng['longitude']
-        config.log("  Added: geographic features")
     
     # ------------------------------------------------------------------------
-    # SEASONAL FEATURES
+    # TEMPORAL AND SEASONAL FEATURES
     # ------------------------------------------------------------------------
     
+    # Cyclical encoding of day of year
+    # Sin/cos encoding preserves cyclical nature (day 365 is close to day 1)
+    # Avoids discontinuity that would occur with raw day number
+    # Month provides coarser seasonal signal
+    # Fire season flag identifies May-October period (peak fire activity)
     df_eng['day_of_year'] = df_eng['datetime_parsed'].dt.dayofyear
     df_eng['day_sin'] = np.sin(2 * np.pi * df_eng['day_of_year'] / 365.25)
     df_eng['day_cos'] = np.cos(2 * np.pi * df_eng['day_of_year'] / 365.25)
     df_eng['month'] = df_eng['datetime_parsed'].dt.month
     df_eng['is_fire_season'] = ((df_eng['month'] >= 5) & (df_eng['month'] <= 10)).astype(int)
-    config.log("  Added: seasonal features")
     
     # ------------------------------------------------------------------------
-    # TEMPORAL ROLLING FEATURES
+    # ROLLING WINDOW FEATURES
     # ------------------------------------------------------------------------
+    # Multi-day averages capture weather trends and persistence.
+    # Grouped by location to prevent information leakage across sites.
+    # min_periods=1 allows calculation even for first few days.
     
-    config.log("  Computing temporal rolling features...")
     grouped = df_eng.groupby(['latitude', 'longitude'], group_keys=False)
     
     # Temperature rolling averages
-    df_eng['temp_3day_avg'] = grouped['temp_avg'].transform(
-        lambda x: x.rolling(window=3, min_periods=1).mean()
-    )
-    df_eng['temp_7day_avg'] = grouped['temp_avg'].transform(
-        lambda x: x.rolling(window=7, min_periods=1).mean()
-    )
+    # 3-day captures short-term heat persistence
+    # 7-day captures weekly-scale weather patterns
+    if 'temp_avg' in df_eng.columns:
+        df_eng['temp_3day_avg'] = grouped['temp_avg'].transform(
+            lambda x: x.rolling(window=3, min_periods=1).mean()
+        )
+        df_eng['temp_7day_avg'] = grouped['temp_avg'].transform(
+            lambda x: x.rolling(window=7, min_periods=1).mean()
+        )
     
     # VPD rolling averages
+    # Captures atmospheric drying trends over multiple days
+    # Persistent high VPD indicates sustained drought stress
     if 'vpd' in df_eng.columns:
         df_eng['vpd_3day_avg'] = grouped['vpd'].transform(
             lambda x: x.rolling(window=3, min_periods=1).mean()
@@ -242,6 +280,7 @@ def engineer_features(df, config):
         )
     
     # Humidity rolling average
+    # 3-day average smooths daily fluctuations in moisture
     if 'humidity_avg' in df_eng.columns:
         df_eng['humidity_3day_avg'] = grouped['humidity_avg'].transform(
             lambda x: x.rolling(window=3, min_periods=1).mean()
@@ -250,30 +289,49 @@ def engineer_features(df, config):
     # ------------------------------------------------------------------------
     # LAG FEATURES
     # ------------------------------------------------------------------------
+    # Previous day values provide temporal context and baseline for comparison.
+    # Shift(1) moves values down by one row within each location group.
     
-    df_eng['temp_lag1'] = grouped['temp_avg'].shift(1)
-    df_eng['vpd_lag1'] = grouped['vpd'].shift(1) if 'vpd' in df_eng.columns else 0
-    df_eng['humidity_lag1'] = grouped['humidity_avg'].shift(1) if 'humidity_avg' in df_eng.columns else 0
+    if 'temp_avg' in df_eng.columns:
+        df_eng['temp_lag1'] = grouped['temp_avg'].shift(1)
+    if 'vpd' in df_eng.columns:
+        df_eng['vpd_lag1'] = grouped['vpd'].shift(1)
+    if 'humidity_avg' in df_eng.columns:
+        df_eng['humidity_lag1'] = grouped['humidity_avg'].shift(1)
     
     # ------------------------------------------------------------------------
-    # RATE OF CHANGE
+    # RATE OF CHANGE FEATURES
     # ------------------------------------------------------------------------
+    # Day-to-day differences capture rapid changes in conditions.
+    # Sudden increases in temperature or VPD can indicate fire risk spikes.
+    # Diff() computes difference from previous row within each group.
     
-    df_eng['temp_change'] = grouped['temp_avg'].diff()
-    df_eng['humidity_change'] = grouped['humidity_avg'].diff() if 'humidity_avg' in df_eng.columns else 0
-    df_eng['vpd_change'] = grouped['vpd'].diff() if 'vpd' in df_eng.columns else 0
+    if 'temp_avg' in df_eng.columns:
+        df_eng['temp_change'] = grouped['temp_avg'].diff()
+    if 'humidity_avg' in df_eng.columns:
+        df_eng['humidity_change'] = grouped['humidity_avg'].diff()
+    if 'vpd' in df_eng.columns:
+        df_eng['vpd_change'] = grouped['vpd'].diff()
     
-    # Fill missing values from lag operations
-    lag_cols = ['temp_lag1', 'vpd_lag1', 'humidity_lag1', 'temp_change', 'humidity_change', 'vpd_change']
+    # ------------------------------------------------------------------------
+    # MISSING VALUE HANDLING
+    # ------------------------------------------------------------------------
+    # Lag and diff operations create NaN values for first observations at
+    # each location. Backfill within groups propagates first valid value
+    # backward, then any remaining NaN are filled with zero.
+    
+    lag_cols = ['temp_lag1', 'vpd_lag1', 'humidity_lag1', 
+                'temp_change', 'humidity_change', 'vpd_change']
     for col in lag_cols:
         if col in df_eng.columns:
-            df_eng[col] = grouped[col].transform(lambda x: x.fillna(method='bfill').fillna(0))
+            df_eng[col] = grouped[col].transform(lambda x: x.bfill().fillna(0))
     
-    elapsed = (time.time() - start_time) / 60
-    config.log(f"  Feature engineering complete: {elapsed:.1f} min")
+    # Clean up temporary columns used during feature construction
+    df_eng.drop(columns=['datetime', 'datetime_parsed', 'day_of_year'], 
+                errors='ignore', inplace=True)
     
-    # Clean up temporary columns
-    df_eng = df_eng.drop(columns=['datetime_parsed', 'day_of_year'], errors='ignore')
+    elapsed = time.time() - start_time
+    
     return df_eng
 
 # ============================================================================
@@ -281,53 +339,48 @@ def engineer_features(df, config):
 # ============================================================================
 
 def main():
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Preprocess wildfire dataset for quantum ML')
-    parser.add_argument('--data', type=str, default='../data/Wildfire_Dataset.csv',
-                       help='Path to Wildfire_Dataset.csv')
-    parser.add_argument('--output', type=str, default='./preprocessed',
-                       help='Output directory for preprocessed files')
-    parser.add_argument('--models', type=int, default=12,
-                       help='Number of model shards to create')
-    args = parser.parse_args()
+    """
+    Main preprocessing execution pipeline.
     
-    # Initialize configuration
-    config = PreprocessConfig(
-        data_path=args.data,
-        output_dir=args.output,
-        n_models=args.models
-    )
+    Orchestrates the complete data preparation workflow:
+        1. Load raw CSV dataset
+        2. Apply comprehensive feature engineering
+        3. Extract features and target variable
+        4. Standardize features using StandardScaler
+        5. Pad or truncate to required 64-feature dimension
+        6. Perform stratified train/validation/test split
+        7. Shard each split across N_MODELS for parallel training
+        8. Save preprocessed shards and metadata
     
+    The stratified splitting ensures class balance is preserved across all
+    splits and model shards, critical for handling the severe class imbalance
+    (~5% wildfire occurrence rate).
+    
+    Outputs:
+        - preprocessed/model_X.pkl: Data shard for model X (X=1..12)
+        - preprocessed/metadata.pkl: Scaler and feature information
+        - logs/preprocess.log: Detailed processing log
+    
+    Raises:
+        SystemExit: On missing input file or processing failure
+    """
     start = time.time()
-    
+
     try:
-        config.log("="*80)
-        config.log("QUANTUM WILDFIRE PREPROCESSING PIPELINE")
-        config.log("="*80)
-        config.log(f"Input: {config.data_path}")
-        config.log(f"Output: {config.output_dir}")
-        config.log(f"Models: {config.n_models}")
-        config.log(f"Target features: {config.target_features} (for {config.n_qubits}-qubit encoding)")
-        config.log("")
-        
         # --------------------------------------------------------------------
-        # DATA LOADING
+        # DATASET LOADING
         # --------------------------------------------------------------------
         
-        if not os.path.exists(config.data_path):
-            config.log(f"[ERROR] Dataset not found: {config.data_path}")
-            config.log("Download from: https://www.kaggle.com/datasets/firecastrl/us-wildfire-dataset")
+        if not os.path.exists(RAW_CSV):
             sys.exit(1)
-        
-        config.log(f"[STEP] Loading dataset from {config.data_path}...")
-        df = pd.read_csv(config.data_path)
-        config.log(f"[INFO] Loaded {len(df):,} samples, mem={mem_gb():.3f} GB")
-        
+
+        df = pd.read_csv(RAW_CSV)
+
         # --------------------------------------------------------------------
         # FEATURE ENGINEERING
         # --------------------------------------------------------------------
         
-        df = engineer_features(df, config)
+        df = engineer_features(df)
 
         # --------------------------------------------------------------------
         # FEATURE AND TARGET EXTRACTION
@@ -337,83 +390,86 @@ def main():
         if target_col not in df.columns:
             raise KeyError(f"Missing expected target column '{target_col}'")
         
-        # Exclude metadata columns
+        # Exclude metadata columns from feature set
         drop_cols = ['Unnamed: 0']
         feature_cols = [c for c in df.columns if c not in drop_cols + [target_col]]
         
-        config.log(f"[INFO] Feature columns before padding: {len(feature_cols)}")
 
-        # Convert to numpy arrays
+        # Convert to numpy arrays with appropriate dtypes
+        # float32 reduces memory footprint while maintaining precision
+        # Target is binary: 1 for wildfire, 0 for no wildfire
         X = df[feature_cols].values.astype(np.float32)
         y = np.array([1 if str(v).lower() in ['yes', 'true', '1'] else 0 
                       for v in df[target_col].values], dtype=np.int8)
         
-        config.log(f"[INFO] Converted to NumPy: X={X.shape}, y={y.shape}, mem={mem_gb():.3f} GB")
-        config.log(f"[INFO] Class balance: {y.mean():.3%} fires")
 
         # --------------------------------------------------------------------
         # FEATURE STANDARDIZATION
         # --------------------------------------------------------------------
+        # StandardScaler transforms features to zero mean and unit variance.
+        # Fit on entire dataset (transformation, not learning from test).
+        # Critical for quantum amplitude embedding which is sensitive to scale.
         
         scaler = StandardScaler()
         X = scaler.fit_transform(X)
-        config.log(f"[STEP] Scaling complete, mem={mem_gb():.3f} GB")
 
         # --------------------------------------------------------------------
         # DIMENSION ADJUSTMENT
         # --------------------------------------------------------------------
+        # Quantum amplitude embedding requires exactly 2^n_qubits features.
+        # For 6 qubits, need exactly 64 features.
+        # Truncate if too many, pad with zeros if too few.
         
-        if X.shape[1] > config.target_features:
-            config.log(f"[WARN] Truncating from {X.shape[1]} to {config.target_features} features")
-            X = X[:, :config.target_features]
-        elif X.shape[1] < config.target_features:
-            pad = config.target_features - X.shape[1]
-            config.log(f"[INFO] Padding from {X.shape[1]} to {config.target_features} features (+{pad} zeros)")
+        if X.shape[1] > TARGET_FEATURES:
+            X = X[:, :TARGET_FEATURES]
+        elif X.shape[1] < TARGET_FEATURES:
+            pad = TARGET_FEATURES - X.shape[1]
             X = np.hstack([X, np.zeros((len(X), pad), dtype=np.float32)])
         
-        config.log(f"[INFO] Final feature count: {X.shape[1]}")
 
         # --------------------------------------------------------------------
         # STRATIFIED TRAIN/VALIDATION/TEST SPLIT
         # --------------------------------------------------------------------
+        # Two-stage splitting: first separate training set, then split
+        # remaining into validation and test. Stratification ensures class
+        # balance is preserved in all splits (critical with 5% fire rate).
         
-        config.log("[STEP] Performing stratified train/val/test split...")
         
         # First split: train vs (val+test)
         X_train, X_temp, y_train, y_temp = train_test_split(
             X, y, 
-            test_size=(config.val_ratio + config.test_ratio),
+            test_size=(VAL_RATIO + TEST_RATIO),  # 30% for val+test
             random_state=42,
-            stratify=y
+            stratify=y  # Preserve class balance
         )
         
-        # Second split: val vs test
-        val_ratio_adjusted = config.val_ratio / (config.val_ratio + config.test_ratio)
+        # Second split: val vs test from the temporary set
+        val_ratio_adjusted = VAL_RATIO / (VAL_RATIO + TEST_RATIO)
         X_val, X_test, y_val, y_test = train_test_split(
             X_temp, y_temp,
-            test_size=(1 - val_ratio_adjusted),
+            test_size=(1 - val_ratio_adjusted),  # Split temp 50/50
             random_state=42,
             stratify=y_temp
         )
         
-        config.log(f"[INFO] Split sizes - Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-        config.log(f"[INFO] Class balance - Train: {y_train.mean():.3%}, Val: {y_val.mean():.3%}, Test: {y_test.mean():.3%}")
 
         # --------------------------------------------------------------------
         # MODEL-WISE SHARDING
         # --------------------------------------------------------------------
+        # Each model receives a stratified random sample from each split.
+        # This ensures all models see similar data distributions while
+        # maintaining statistical independence for ensemble diversity.
         
-        config.log(f"[STEP] Sharding data across {config.n_models} models with stratified sampling...")
         
-        for model_id in range(1, config.n_models + 1):
-            shard_size = 1.0 / config.n_models
+        for model_id in range(1, N_MODELS + 1):
+            shard_size = 1.0 / N_MODELS  # Each model gets 1/12 of data
             
-            # Shard training data
+            # Shard training data with stratification
             if len(X_train) > 0:
                 _, X_train_shard, _, y_train_shard = train_test_split(
                     X_train, y_train,
                     test_size=shard_size,
-                    random_state=42 + model_id,
+                    random_state=42 + model_id,  # Different seed per model
                     stratify=y_train
                 )
             else:
@@ -424,7 +480,7 @@ def main():
                 _, X_val_shard, _, y_val_shard = train_test_split(
                     X_val, y_val,
                     test_size=shard_size,
-                    random_state=42 + model_id + 100,
+                    random_state=42 + model_id + 100,  # Offset seed for independence
                     stratify=y_val
                 )
             else:
@@ -441,8 +497,8 @@ def main():
             else:
                 X_test_shard, y_test_shard = X_test, y_test
 
-            # Save shard
-            out_path = os.path.join(config.output_dir, f"model_{model_id}.pkl")
+            # Save shard to disk
+            out_path = os.path.join(PREPROC_DIR, f"model_{model_id}.pkl")
             with open(out_path, 'wb') as f:
                 pickle.dump({
                     'X_train': X_train_shard,
@@ -451,40 +507,35 @@ def main():
                     'y_val': y_val_shard,
                     'X_test': X_test_shard,
                     'y_test': y_test_shard
-                }, f, protocol=4)
+                }, f, protocol=4)  # Protocol 4 for Python 3.4+ compatibility
             
-            config.log(f"[SAVED] {out_path} | Train: {len(X_train_shard)}, Val: {len(X_val_shard)}, Test: {len(X_test_shard)} | Fire%: {y_train_shard.mean():.3%}")
 
         # --------------------------------------------------------------------
         # METADATA PERSISTENCE
         # --------------------------------------------------------------------
+        # Save preprocessing configuration for reproducibility and future
+        # inference on new data.
         
-        meta_path = os.path.join(config.output_dir, 'metadata.pkl')
+        meta_path = os.path.join(PREPROC_DIR, 'metadata.pkl')
         with open(meta_path, 'wb') as f:
             pickle.dump({
-                'feature_cols': feature_cols,
-                'scaler': scaler,
+                'feature_cols': feature_cols,           # Original feature names
+                'scaler': scaler,                       # Fitted StandardScaler
                 'split_ratios': {
-                    'train': config.train_ratio,
-                    'val': config.val_ratio,
-                    'test': config.test_ratio
+                    'train': TRAIN_RATIO,
+                    'val': VAL_RATIO,
+                    'test': TEST_RATIO
                 },
                 'sampling_method': 'stratified',
                 'feature_engineering': 'full_classical_matching',
-                'n_qubits': config.n_qubits,
-                'target_features': config.target_features,
                 'notes': 'Full feature engineering matching classical model, no data leakage'
             }, f, protocol=4)
-        config.log(f"[SAVED] Metadata saved -> {meta_path}")
 
         total_time = time.time() - start
-        config.log(f"")
-        config.log(f"Preprocessing complete in {total_time:.2f}s ({total_time/60:.1f} min), mem={mem_gb():.3f} GB")
-        config.log("="*80)
+        input("\n[PAUSE] Preprocessing done. Press Enter to close...")
         
     except Exception as e:
-        config.log(f"[FATAL] Exception: {e}")
-        config.log(traceback.format_exc())
+        input("\n[PAUSE] Preprocessing failed. Press Enter to close...")
         sys.exit(1)
 
 if __name__ == "__main__":
